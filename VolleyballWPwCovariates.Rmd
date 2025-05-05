@@ -1,0 +1,441 @@
+---
+title: "vb wp model"
+author: "Naomi Consiglio"
+date: "2025-03-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE}
+library(dplyr)
+library(markovchain)
+library(readr)
+
+plays <- read_csv('C:/Users/naomi/Downloads/Rice 2023 DVWs/rice23_datavolley.csv')
+plays_cleaned <- plays %>% 
+  mutate(attack_type = case_when(
+    skill_subtype == 'Hard spike' | lag(skill_subtype) == 'Hard spike' ~ 'hard attack',
+    skill_subtype == 'Tip' | skill_subtype == 'Soft spike/topspin' | 
+      lag(skill_subtype) == 'Tip' | lag(skill_subtype) == 'Soft spike/topspin' ~ 'soft attack',
+    TRUE ~ NA_character_
+  ))
+
+plays_cleaned <- plays_cleaned %>% mutate(score_diff = home_score_start_of_point - visiting_score_start_of_point)
+plays_cleaned <- plays_cleaned %>% mutate(
+    is_last_contact = lead(point, default = FALSE)
+  )
+
+plays_cleaned <- plays_cleaned %>%
+  mutate(
+    point_state = ifelse(is_last_contact, "Point", "No Point")
+  )
+
+data <- plays_cleaned %>%
+  relocate(attack_type, .after = skill_subtype) %>%
+  relocate(score_diff, .after = visiting_score_start_of_point)
+```
+
+
+```{r}
+library(dplyr)
+library(tibble)
+library(tidyverse)
+
+# Get rid of rows in df that aren't in play
+data <- data %>% filter(!is.na(skill))
+
+
+# Step 1: Map skills to game complexes
+data <- data %>%
+  mutate(
+    game_complex = case_when(
+      skill == "Serve" ~ "K0",
+      skill == "Reception" ~ "K1",
+      skill == "Set" ~ "K1",
+      skill == "Attack" ~ "K1",
+      skill == "Block" ~ "K2",
+      skill == "Dig" ~ "K2",
+      skill == "Freeball" ~ "K5",
+      TRUE ~ "UK"  # Undefined complex
+    )
+  )
+
+#  Step 2: Map evaluation codes to complex efficacy
+data <- data %>%
+  mutate(
+    complex_efficacy = case_when(
+      evaluation_code == "#" ~ 4,  # Perfect (in-system offense)
+      evaluation_code == "+" ~ 3,  # Good (in-system offense)
+      evaluation_code == "!" ~ 2,  # Neutral (out-of-system)
+      evaluation_code == "-" ~ 1,  # Bad (out-of-system)
+      evaluation_code == "=" ~ 0,   # Error (no continuity)
+      
+      # Context-specific handling for "/"
+      evaluation_code == "/" & skill == "Serve" ~ 3,     # Good serve (forced overpass)
+      evaluation_code == "/" & skill %in% c("Reception", "Dig", "Freeball") ~ 1,  # Bad pass/dig (overpass)
+      evaluation_code == "/" & skill == "Attack" ~ 0,    # Stuff block = Error
+      evaluation_code == "/" & skill == "Block" ~ 2,     # Block returned = Neutral (invasion)
+
+    )
+  )
+
+# Step 3: Map serving team to possession
+data <- data %>%
+  mutate(
+    possession = ifelse(serving_team == team, "touchby1", "touchby0"),
+  )
+
+data <- data %>%
+  mutate(
+    point_won = case_when(
+      point_state == "Point" & point_won_by == serving_team ~ "_pt1",
+      point_state == "Point" & point_won_by != serving_team ~ "_pt0",
+      TRUE ~ ""
+    )
+  )
+
+# Add a weight column based on score differential
+# You can tweak the "scaling_factor" to control impact strength
+scaling_factor <- 0.2
+data <- data %>%
+  mutate(weight = 1 / (1 + exp(-scaling_factor * score_diff)))
+
+# Add rally_id within each set
+data <- data %>%
+  group_by(match_id, set_number) %>%
+  mutate(rally_id = dense_rank(point_id)) %>%
+  ungroup()
+
+# Create time-weighting factor (points later in set matter more)
+data <- data %>%
+  mutate(
+    # Normalized rally position (0-1 scale within set)
+    rally_position = rally_id / max(rally_id, na.rm = TRUE),
+    
+    # Logistic weighting curve (adjust k for steeper weighting)
+    time_weight = 1 / (1 + exp(-4*(rally_position - 0.5))),  # k=4 controls steepness
+    
+    # Combine with existing score_diff weight
+    combined_weight = weight * time_weight
+  )
+
+match_numbering <- data %>%
+  distinct(match_id, home_team, visiting_team) %>%
+  # Create consistent team combination string
+  mutate(team_combo = paste0(visiting_team, " at ", home_team)) %>%
+  # Group by team combination
+  group_by(team_combo) %>%
+  # Number matches sequentially within each combo
+  mutate(match_num = row_number()) %>%
+  # Create user-friendly ID
+  mutate(match_id_user = ifelse(n() > 1,
+                                  paste0(team_combo, " (", match_num, ")"),
+                                  team_combo)) %>%
+  ungroup() %>%
+  select(match_id, match_id_user, team_combo, match_num) # Keep team_combo and match_num for the 'match' variable
+
+
+# Join back to original data
+data <- data %>%
+  left_join(match_numbering, by = "match_id") %>%
+  relocate(match_id_user, .after = match_id) %>%
+  mutate(match = paste0(team_combo, " ", match_num)) %>% # Create the 'match' variable
+  select(-team_combo, -match_num, -match_id_user) # Remove intermediate columns
+
+# Step 3: Create the state column
+data <- data %>%
+  mutate(
+    state = paste0(game_complex, "_", complex_efficacy, "_", possession, point_won)
+  )
+
+# Step 4: Create the transition matrix
+transition_matrix <- data %>%
+  mutate(next_state = lead(state, default = "End")) %>%
+  filter(state != "End" & next_state != "End") %>%
+  group_by(state, next_state) %>%
+  summarise(weighted_n = sum(combined_weight, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = next_state, values_from = weighted_n, values_fill = list(weighted_n = 0)) %>%
+  column_to_rownames("state")
+
+# Normalize the transition matrix
+transition_matrix <- transition_matrix / rowSums(transition_matrix, na.rm = TRUE)
+transition_matrix[is.na(transition_matrix)] <- 0
+
+
+# Step 5: Create the Markov chain object
+library(markovchain)
+markov_chain <- new("markovchain", states = rownames(transition_matrix), 
+                    transitionMatrix = transition_matrix, name = "Volleyball Markov Chain w/ Covariates")
+
+# View the transition matrix
+print(transition_matrix)
+
+# Step 6: Visualize the Markov chain
+plot(markov_chain)
+```
+
+
+```{r}
+# Function to simulate a volleyball game
+simulate_volleyball_game <- function(markov_chain, initial_state,
+                                     current_score_A,
+                                     current_score_B,
+                                     serving_team,
+                                     winning_score = 25,
+                                     max_points = 60) {
+  # Initialize the game state
+  current_state <- initial_state
+  score <- c(current_score_A, current_score_B)  # score[1] = Team A, score[2] = Team B
+
+  # Initialize game log
+  game_log <- data.frame(
+    state = character(),
+    serving_team = character(),
+    score_TeamA = integer(),
+    score_TeamB = integer(),
+    stringsAsFactors = FALSE
+  )
+
+  # Simulate the game
+  while ((max(score) < winning_score || abs(score[1] - score[2]) < 2) && sum(score) < max_points) {
+    
+    # Get transition probabilities
+    transition_probs <- markov_chain@transitionMatrix[current_state, ]
+
+    # Sample next state
+    next_state <- sample(names(transition_probs), size = 1, prob = transition_probs)
+
+    # Log current state
+    game_log <- rbind(game_log, data.frame(
+      state = next_state,
+      serving_team = serving_team,
+      score_TeamA = score[1],
+      score_TeamB = score[2],
+      stringsAsFactors = FALSE
+    ))
+
+    # Check if point awarded
+    if (grepl("_pt1$", next_state)) {
+      # Point to serving team
+      if (serving_team == "Team A") {
+        score[1] <- score[1] + 1
+      } else {
+        score[2] <- score[2] + 1
+      }
+    } else if (grepl("_pt0$", next_state)) {
+      # Point to receiving team and switch server
+      if (serving_team == "Team A") {
+        score[2] <- score[2] + 1
+        serving_team <- "Team B"
+      } else {
+        score[1] <- score[1] + 1
+        serving_team <- "Team A"
+      }
+    }
+
+    # Update state
+    current_state <- next_state
+  }
+
+  # Return results
+  return(list(
+    game_log = game_log,
+    final_score = score
+  ))
+}
+
+```
+
+```{r}
+simulate_win_probability <- function(markov_chain, initial_state, current_score_A, current_score_B, serving_team, simulations = 100) {
+  teamA_wins <- 0
+  
+  for (i in 1:simulations) {
+    result <- simulate_volleyball_game(markov_chain, 
+                                       initial_state = initial_state, 
+                                       winning_score = 25, 
+                                       max_points = 60,
+                                       current_score_A = current_score_A,
+                                       current_score_B = current_score_B,
+                                       serving_team = serving_team)
+    if (result$final_score[1] > result$final_score[2]) {
+      teamA_wins <- teamA_wins + 1
+    }
+  }
+  win_prob <- (teamA_wins / simulations)*100
+  return(win_prob)
+}
+
+```
+
+
+
+
+
+## Where you can select sets from specific matches
+
+```{r}
+
+# Update the plotting code to allow user input for match and set
+library(ggplot2)
+library(progress)
+
+# Function to analyze a specific set
+analyze_set_win_probability <- function(match_id_input, set_num) {
+  # Filter data for the selected match and set
+  match_data <- data %>% 
+    filter(match == match_id_input, set_number == set_num)
+  
+  # Check if data exists for this match/set
+  if (nrow(match_data) == 0) {
+    stop("No data available for this match and set combination")
+  }
+  
+  # Determine if Rice is home or visiting
+  rice_is_home <- unique(match_data$home_team) == "Rice University"
+  
+  # Initialize vector for Rice win probabilities
+  win_probs <- numeric()
+  rally_ids <- unique(match_data$point_id)
+  
+  # Create a progress bar
+  pb <- progress_bar$new(total = length(rally_ids), 
+                         format = "(:spin) [:bar] :percent Elapsed: :elapsedfull ETA: :eta")
+  
+  # Loop through rallies
+  for (i in seq_along(rally_ids)) {
+    rally <- match_data %>% filter(point_id == rally_ids[i]) %>% slice(1)
+    
+    # Set state, serving team, and score
+    state <- rally$state
+    score_A <- if (rice_is_home) rally$home_score_start_of_point else rally$visiting_score_start_of_point
+    score_B <- if (rice_is_home) rally$visiting_score_start_of_point else rally$home_score_start_of_point
+    serving_team <- ifelse(rally$serving_team == ifelse(rice_is_home, "home", "visiting"), "Team A", "Team B")
+    
+    # Calculate win probability
+    wp <- simulate_win_probability(
+      markov_chain = markov_chain,
+      initial_state = state,
+      current_score_A = score_A,
+      current_score_B = score_B,
+      serving_team = serving_team,
+      simulations = 100
+    )
+    
+    win_probs[i] <- wp
+    
+    # Update the progress bar
+    pb$tick()
+  }
+  
+  # Build data frame for plotting
+  wp_df <- data.frame(
+    Rally = seq_along(win_probs),
+    WinProbability_Rice = win_probs
+  )
+  
+  # Plot with explicit grouping
+  p <- ggplot(wp_df, aes(x = Rally, y = WinProbability_Rice, group = 1)) +
+    geom_line(color = "darkblue", size = 1.2) +
+    labs(title = paste("Rice Volleyball Set", set_num, "Win Probability"),
+         subtitle = paste("Match:", match_id_input, 
+                          " Set:", set_num),
+         x = "Rally Number",
+         y = "Win Probability for Rice (%)") +
+    ylim(0, 100) +
+    theme_minimal(base_size = 14)
+  
+  return(list(plot = p, data = wp_df))
+}
+
+```
+
+```{r}
+# Get available matches and sets for user selection
+available_matches <- unique(data$match)
+available_sets <- unique(data$set_number)
+
+# Example usage (you can modify these inputs):
+selected_match <- available_matches[1]  # First match
+selected_set <- 4                     # First set
+
+# Run the analysis
+set_analysis <- analyze_set_win_probability(selected_match, selected_set)
+
+# Display the plot
+print(set_analysis$plot)
+
+
+```
+
+
+
+
+## 4/7 Meeting notes:
+Web app: user selects match, selects set, (include only like 5 matches, most competitive ones), have it populate the win probability model and users can hover/click on a part of the graph and it'll say what happened that caused the win probability to go down.
+
+
+```{r}
+# Filter data for the first match
+first_match_data <- data %>% filter(match_id == unique(data$match_id)[1])
+
+# Get the point ID of the second point.
+second_point_id <- unique(first_match_data$point_id)[2]
+
+# Filter the data to get only the second point.
+second_point_data <- first_match_data %>% filter(point_id == second_point_id)
+
+# Get the states from the second point data
+states_in_second_point <- second_point_data$state
+
+# Get the transition probabilities for those states
+transition_probabilities_for_point <- transition_matrix[states_in_second_point, ]
+
+# Remove columns with all zeros
+transition_probabilities_for_point <- transition_probabilities_for_point[, colSums(transition_probabilities_for_point) > 0.2]
+
+# Print the transition probabilities
+View(transition_probabilities_for_point)
+```
+
+
+```{r}
+View(data %>% filter(match == "The University of Southern Mississippi at Rice University 1", set_number == 4))
+
+```
+
+
+
+# Save win probabilities for Shiny App
+```{r}
+# For each match, generate and save a data frame with win probabilities
+match_ids <- unique(data$match)[1:5]
+
+# This list will store wp_df results by match and set
+results_list <- list()
+
+for (match in match_ids) {
+  match_data <- data %>% filter(match == !!match)
+  sets_in_match <- unique(match_data$set_number)
+  
+  set_results <- list()
+  
+  for (set_num in sets_in_match) {
+    
+    # Make sure your function uses this data to simulate and return wp_df
+    sim_output <- analyze_set_win_probability(match, set_num)
+    wp_df <- sim_output$data
+    
+    set_results[[paste0("Set ", set_num)]] <- wp_df
+  }
+  
+  results_list[[paste0("Match: ", match)]] <- set_results
+}
+
+# Save to RDS
+saveRDS(results_list, file = "set_wp_results.rds")
+
+```
